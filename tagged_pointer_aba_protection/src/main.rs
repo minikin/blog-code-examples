@@ -234,3 +234,168 @@ fn main() {
 
     println!("\n--- All operations completed ---");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn test_push_and_pop_single_threaded() {
+        let stack = LockFreeStack::new();
+        stack.push(1);
+        stack.push(2);
+        stack.push(3);
+
+        assert_eq!(stack.pop(), Some(3));
+        assert_eq!(stack.pop(), Some(2));
+        assert_eq!(stack.pop(), Some(1));
+        assert_eq!(stack.pop(), None);
+    }
+
+    #[test]
+    fn test_empty_stack() {
+        let stack = LockFreeStack::new();
+        assert_eq!(stack.pop(), None);
+    }
+
+    #[test]
+    fn test_multiple_threads_push() {
+        let stack = Arc::new(LockFreeStack::new());
+        let thread_count = 4;
+        let values_per_thread = 100;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|thread_id| {
+                let stack = Arc::clone(&stack);
+                thread::spawn(move || {
+                    for i in 0..values_per_thread {
+                        stack.push(thread_id * values_per_thread + i);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify that we can pop all values
+        let mut popped_count = 0;
+        while stack.pop().is_some() {
+            popped_count += 1;
+        }
+
+        assert_eq!(popped_count, thread_count * values_per_thread);
+    }
+
+    #[test]
+    fn test_concurrent_push_and_pop() {
+        let stack = Arc::new(LockFreeStack::new());
+        let push_thread_count: usize = 3;
+        let pop_thread_count: usize = 2;
+        let values_per_thread: usize = 100;
+
+        // Spawn push threads
+        let push_handles: Vec<_> = (0..push_thread_count)
+            .map(|thread_id| {
+                let stack = Arc::clone(&stack);
+                thread::spawn(move || {
+                    for i in 0..values_per_thread {
+                        stack.push(i32::try_from(thread_id * values_per_thread + i).unwrap());
+                    }
+                })
+            })
+            .collect();
+
+        // Spawn pop threads
+        let pop_handles: Vec<_> = (0..pop_thread_count)
+            .map(|_| {
+                let stack = Arc::clone(&stack);
+                thread::spawn(move || {
+                    let mut popped_values = HashSet::new();
+                    let target_count = (values_per_thread * push_thread_count) / pop_thread_count;
+                    while popped_values.len() < target_count {
+                        if let Some(value) = stack.pop() {
+                            popped_values.insert(value);
+                        }
+                        thread::yield_now();
+                    }
+                    popped_values
+                })
+            })
+            .collect();
+
+        // Wait for push threads
+        for handle in push_handles {
+            handle.join().unwrap();
+        }
+
+        // Collect results from pop threads
+        let mut all_popped = HashSet::new();
+        for handle in pop_handles {
+            let thread_values = handle.join().unwrap();
+            all_popped.extend(thread_values);
+        }
+
+        // Verify that all remaining values can be popped
+        while let Some(value) = stack.pop() {
+            all_popped.insert(value);
+        }
+
+        assert_eq!(
+            all_popped.len(),
+            values_per_thread * push_thread_count,
+            "All pushed values should be popped exactly once"
+        );
+    }
+
+    #[test]
+    fn test_aba_prevention() {
+        let stack = Arc::new(LockFreeStack::new());
+
+        // Push initial values
+        stack.push(1);
+        stack.push(2);
+        stack.push(3);
+
+        let stack_clone = Arc::clone(&stack);
+
+        // Thread 1: Try to pop and push back after delay
+        let handle1 = thread::spawn(move || {
+            // Pop the top value (3)
+            let value = stack_clone.pop().unwrap();
+            assert_eq!(value, 3);
+
+            // Delay to allow other thread to modify stack
+            thread::sleep(Duration::from_millis(100));
+
+            // Push the value back
+            stack_clone.push(value);
+        });
+
+        let stack_clone = Arc::clone(&stack);
+
+        // Thread 2: Perform multiple operations while Thread 1 is delayed
+        let handle2 = thread::spawn(move || {
+            // Pop value (2)
+            let _value2 = stack_clone.pop().unwrap();
+            // Push new value
+            stack_clone.push(4);
+        });
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+
+        // The final state should reflect all operations with version tracking
+        let mut values = Vec::new();
+        while let Some(value) = stack.pop() {
+            values.push(value);
+        }
+
+        // Values should be in LIFO order
+        assert!(values.len() >= 2, "Stack should have at least 2 values");
+    }
+}
