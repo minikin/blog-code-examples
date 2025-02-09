@@ -1,0 +1,6 @@
+[package]
+name = "tagged_pointer_aba_protection"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
