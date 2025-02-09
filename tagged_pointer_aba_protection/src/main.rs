@@ -1,5 +1,5 @@
 #![feature(integer_atomics)]
-#![feature(test)] // Enable benchmarking features
+#![feature(test)]
 
 //! # Lock-Free Stack with ABA Protection
 //!
