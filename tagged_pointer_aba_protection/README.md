@@ -16,6 +16,34 @@ Thread 2:    Remove A → Add B → Remove B → Add A
 
 This implementation uses version counting to prevent the ABA problem. Each pointer is paired with a version number that gets incremented on every modification, even if the same value is being added back to the stack.
 
+>
+> This implementation uses `unsafe` code in several places for raw pointer manipulation.
+> Here's why each unsafe block is safe:
+>
+> 1. Node Creation/Deletion:
+>    - `Box::into_raw` is used only for newly created boxes, ensuring valid pointer creation
+>    - `Box::from_raw` is only called on pointers that were created via `Box::into_raw`
+>    - The stack maintains exclusive ownership of nodes through version counting
+>    - No double-frees can occur due to ABA prevention via versioning
+>
+> 2. Pointer Dereferencing:
+>    - Pointers are only dereferenced after successful CAS operations
+>    - Version checking ensures we never use dangling pointers
+>    - `next` pointers are only accessed while holding a reference to the current node
+>    - Null checks are performed before any pointer dereference
+>
+> 3. MaybeUninit Usage:
+>    - Values are initialized immediately in `push()` using `MaybeUninit::new()`
+>    - `assume_init()` is only called in `pop()` after successful CAS
+>    - Values are never read before initialization
+>    - Dropped nodes are properly reconstructed into boxes
+>
+> 4. Memory Ordering:
+>    - `Acquire` ordering on loads ensures visibility of node contents
+>    - `Release` ordering on stores ensures all previous writes are visible
+>    - `Relaxed` ordering is only used for operations that don't require synchronization
+>    - Full memory fence on successful CAS operations maintains proper happens-before relationships
+
 ## Running the Tests
 
 To run the regular test suite:
