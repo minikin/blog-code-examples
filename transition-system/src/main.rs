@@ -499,6 +499,11 @@ fn main() {
     // Print the transition history
     book_system.print_history();
 
+    // Save the state to a file before simulating a restart
+    if let Err(e) = book_system.save_state_to_file() {
+        println!("Error saving state: {}", e);
+    }
+
     // In a real application, we would have a completely separate run here
     // To simulate this, we'll load the state from the file
     println!("\n--- Simulating application restart ---\n");
