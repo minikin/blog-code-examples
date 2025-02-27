@@ -64,7 +64,7 @@ impl<T: Send + Sync + 'static> LockFreeQueue<T> {
             value: None,
             next: Atomic::null(),
         });
-        let sentinel_shared = sentinel.into_shared(unsafe { &epoch::unprotected() });
+        let sentinel_shared = sentinel.into_shared(unsafe { epoch::unprotected() });
         Self {
             head: Atomic::from(sentinel_shared),
             tail: Atomic::from(sentinel_shared),
@@ -222,7 +222,7 @@ impl<T: Send + Sync + 'static> Default for LockFreeQueue<T> {
 
 impl<T> Drop for LockFreeQueue<T> {
     fn drop(&mut self) {
-        let guard = unsafe { &epoch::unprotected() };
+        let guard = unsafe { epoch::unprotected() };
         let mut current = self.head.load(Ordering::Relaxed, guard);
 
         while !current.is_null() {
