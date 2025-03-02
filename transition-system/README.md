@@ -2,9 +2,23 @@
 
 A state machine implementation for tracking the status of library books using Rust.
 
+- [Library Book State Machine](#library-book-state-machine)
+  - [Overview](#overview)
+  - [Key Features](#key-features)
+  - [Project Architecture](#project-architecture)
+  - [Running the Example](#running-the-example)
+  - [Visualizing the State Machine](#visualizing-the-state-machine)
+  - [Visualization Features](#visualization-features)
+    - [Text-Based Visualization](#text-based-visualization)
+    - [Graphical Visualization](#graphical-visualization)
+    - [Example Visualization Output](#example-visualization-output)
+  - [Testing](#testing)
+  - [Future Improvements](#future-improvements)
+
 ## Overview
 
-This project implements a state machine that models the lifecycle of a library book. Books can transition between various states such as:
+This project implements a state machine that models the lifecycle of a library book. 
+Books can transition between various states such as:
 
 - Available
 - Reserved
@@ -120,8 +134,5 @@ cargo test
 3. **Configuration**:
    - Allow external configuration of the state machine through config files
 
-4. **Visualization**:
-   - Add tools to visualize the state machine and its transitions
-
-5. **Performance**:
+4. **Performance**:
    - Optimize transition lookups for large state machines 
