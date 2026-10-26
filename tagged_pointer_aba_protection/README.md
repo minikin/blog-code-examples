@@ -32,6 +32,8 @@ Miri checks the unsafe code, including the threaded tests. Packing a pointer int
 MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance" cargo +nightly miri test
 ```
 
+`cargo bench` runs the comparison behind the table in the post: this stack against the same pooled stack with plain `AtomicPtr` heads, one thread and eight, each doing a push and then a pop. The plain version is ABA-prone and exists only to price the 64-bit CAS against the 128-bit one.
+
 ## License
 
 MIT
