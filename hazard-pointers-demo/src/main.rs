@@ -2,7 +2,8 @@ use clap::Parser;
 use colored::*;
 use hazard_pointers_demo::LockFreeStack;
 use rand::Rng;
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,10 +13,6 @@ mod test_lockfree;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Enable verbose output with detailed operation logs
-    #[arg(short, long)]
-    verbose: bool,
-
     /// Run a stress test with many concurrent operations
     #[arg(short, long)]
     stress_test: bool,
@@ -57,31 +54,31 @@ fn main() {
     let show_demo = args.show_aba_demo && !args.no_show_aba_demo;
 
     if show_demo {
-        aba_demonstration(args.verbose);
+        aba_demonstration();
     }
 
     if args.stress_test {
-        stress_test(args.verbose);
+        stress_test();
     } else if args.quick_test {
-        quick_verification_test(args.verbose);
+        quick_verification_test();
     } else if !show_demo {
-        basic_demo(args.verbose);
+        basic_demo();
     }
 
     println!("\n{}", "Demonstration complete!".green().bold());
 }
 
 /// Demonstrates a basic usage of our lock-free stack with hazard pointers
-fn basic_demo(verbose: bool) {
+fn basic_demo() {
     println!("{}", "\nRunning basic demonstration...".yellow().bold());
 
-    let stack = LockFreeStack::new(verbose);
+    let stack = LockFreeStack::new();
 
     // Push some values
     println!("Pushing values 1, 2, 3 onto the stack");
-    stack.push(1).expect("Push should succeed");
-    stack.push(2).expect("Push should succeed");
-    stack.push(3).expect("Push should succeed");
+    stack.push(1);
+    stack.push(2);
+    stack.push(3);
 
     println!("Stack size: {}", stack.len());
 
@@ -94,8 +91,10 @@ fn basic_demo(verbose: bool) {
     println!("Stack is now empty: {}", stack.is_empty());
 }
 
-/// Demonstrates how hazard pointers protect against the ABA problem
-fn aba_demonstration(verbose: bool) {
+/// Demonstrates how hazard pointers protect against the ABA problem.
+///
+/// Two channels force one interleaving, so the output is the same every run.
+fn aba_demonstration() {
     println!(
         "{}",
         "\nDemonstrating ABA problem prevention with hazard pointers..."
@@ -103,113 +102,88 @@ fn aba_demonstration(verbose: bool) {
             .bold()
     );
 
-    // Create a shared stack
-    let stack = Arc::new(LockFreeStack::new(verbose));
-
-    // Initial state: Push values onto the stack
-    stack.push(1).expect("Push should succeed");
-    stack.push(2).expect("Push should succeed");
-    stack.push(3).expect("Push should succeed");
-
+    let stack = Arc::new(LockFreeStack::new());
+    stack.push(1);
+    stack.push(2);
+    stack.push(3);
     println!("Initial stack state: [3] → [2] → [1]");
 
-    // Clone the stack for each thread
-    let stack_clone1 = Arc::clone(&stack);
-    let stack_clone2 = Arc::clone(&stack);
+    let (protected_tx, protected_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
 
-    // Thread 1: Will try to pop 3 and then get delayed
-    let handle1 = thread::spawn(move || {
-        println!("{}", "Thread 1: Starting operation".blue());
+    let t1 = {
+        let stack = Arc::clone(&stack);
+        thread::spawn(move || {
+            let head = stack.head.load(Ordering::Acquire);
+            let guard = stack.hazard_pointers.protect(head);
+            println!("{}", "Thread 1: published the head node (value 3)".blue());
+            protected_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
 
-        // Load the head but don't complete the operation
-        let hazard_pointers = &stack_clone1.hazard_pointers;
-        let head = stack_clone1.head.load(std::sync::atomic::Ordering::Acquire);
-        hazard_pointers.protect(head);
+            // The validation step of pop: the head moved while this thread was
+            // away, so it must not use `head` to compute a new head.
+            if stack.head.load(Ordering::Acquire) == head {
+                println!("{}", "Thread 1: head unchanged, safe to continue".blue());
+            } else {
+                println!(
+                    "{}",
+                    "Thread 1: head changed since publication, starting over".blue()
+                );
+            }
+            // Safety: the node is published, so it has not been freed even
+            // though Thread 2 popped it.
+            let value = unsafe { *(*guard.as_ptr()).value };
+            println!(
+                "{}",
+                format!("Thread 1: the protected node is still readable, value {value}").blue()
+            );
+        })
+    };
 
-        println!("{}", "Thread 1: Protected head node (with value 3)".blue());
-
-        // Simulate delay - this is where Thread 2 will make changes
-        println!("{}", "Thread 1: Going to sleep for 200ms...".blue());
-        thread::sleep(Duration::from_millis(200));
-
-        // Try to complete the pop operation
-        println!(
-            "{}",
-            "Thread 1: Waking up and trying to complete pop operation".blue()
-        );
-        let result = stack_clone1.pop();
-        println!("{}", format!("Thread 1: Pop result: {:?}", result).blue());
-
-        result
-    });
-
-    // Thread 2: Will perform multiple operations while Thread 1 is sleeping
-    let handle2 = thread::spawn(move || {
-        // Give Thread 1 time to start and protect its node
-        thread::sleep(Duration::from_millis(50));
-        println!(
-            "{}",
-            "Thread 2: Performing operations while Thread 1 is delayed".magenta()
-        );
-
-        // Pop 3
-        let val = stack_clone2.pop().expect("Stack should have value 3");
-        println!("{}", format!("Thread 2: Popped {}", val).magenta());
-
-        // Pop 2
-        let val = stack_clone2.pop().expect("Stack should have value 2");
-        println!("{}", format!("Thread 2: Popped {}", val).magenta());
-
-        // Push 3 again - This creates the ABA condition!
-        // Without hazard pointers, Thread 1 wouldn't notice this change
-        stack_clone2.push(3).expect("Push should succeed");
-        println!("{}", "Thread 2: Pushed 3 back onto the stack".magenta());
-        println!(
-            "{}",
-            "Thread 2: Created ABA condition (3->1->empty->3->1)"
+    let t2 = {
+        let stack = Arc::clone(&stack);
+        thread::spawn(move || {
+            protected_rx.recv().unwrap();
+            let a = stack.pop().unwrap();
+            let b = stack.pop().unwrap();
+            println!("{}", format!("Thread 2: popped {a} and {b}").magenta());
+            let freed = stack.hazard_pointers.try_reclaim(true);
+            println!(
+                "{}",
+                format!(
+                    "Thread 2: forced a scan, freed {freed} node, {} still retired",
+                    stack.hazard_pointers.retired_len()
+                )
                 .magenta()
-                .bold()
-        );
-    });
+            );
+            stack.push(3);
+            println!("{}", "Thread 2: pushed 3 back onto the stack".magenta());
+            done_tx.send(()).unwrap();
+        })
+    };
 
-    // Wait for both threads to complete
-    let _thread1_result = handle1.join().expect("Thread 1 panicked");
-    handle2.join().expect("Thread 2 panicked");
+    t1.join().expect("Thread 1 panicked");
+    t2.join().expect("Thread 2 panicked");
 
-    // Explain what happened
-    println!("\n{}", "What just happened?".green().bold());
-    println!("1. Thread 1 started a pop operation and protected node with value 3");
-    println!("2. While Thread 1 was sleeping, Thread 2:");
-    println!("   - Popped value 3 from the stack");
-    println!("   - Popped value 2 from the stack");
-    println!("   - Pushed value 3 back onto the stack");
     println!(
-        "3. This created an 'ABA' scenario - the head had value 3, changed to 1, then back to 3"
+        "Thread 1 cleared its slot. A scan now frees {} node.",
+        stack.hazard_pointers.try_reclaim(true)
     );
-    println!("4. When Thread 1 woke up, it was still able to safely continue its operation");
-    println!("5. The hazard pointer protected the original node with value 3 from being reclaimed");
-    println!("   even though it was temporarily removed from the stack");
 
-    // Show the final state
-    println!("\nFinal stack state:");
-    let mut remaining = Vec::new();
-    while let Some(val) = stack.pop() {
-        remaining.push(val);
+    print!("Final stack from the top:");
+    while let Some(value) = stack.pop() {
+        print!(" {value}");
     }
+    println!();
 
-    for val in remaining.iter().rev() {
-        println!("Value: {}", val);
-    }
-
-    // Summary
     println!("\n{}", "Key insight:".yellow().bold());
-    println!("Without hazard pointers, Thread 1 might have accessed invalid memory.");
-    println!("The hazard pointer mechanism ensured that the memory was protected while in use,");
-    println!("preventing use-after-free bugs even in the presence of the ABA pattern.");
+    println!("The node Thread 1 published survived the scan, so its address could not be");
+    println!("handed out again while Thread 1 held it, and reading it stayed valid.");
+    println!("The re-read of head is what tells Thread 1 its snapshot is stale.");
 }
 
 /// Run a stress test with many concurrent operations
-fn stress_test(verbose: bool) {
+fn stress_test() {
     println!(
         "{}",
         "\nRunning stress test with concurrent operations..."
@@ -217,7 +191,7 @@ fn stress_test(verbose: bool) {
             .bold()
     );
 
-    let stack = Arc::new(LockFreeStack::new(verbose));
+    let stack = Arc::new(LockFreeStack::new());
     // Reduce the number of operations for a quicker test
     let num_threads = 4;
     let operations_per_thread = 200;
@@ -257,13 +231,10 @@ fn stress_test(verbose: bool) {
                 // 60% chance to push, 40% chance to pop
                 if rng.random::<f32>() < 0.6 {
                     let value = rng.random::<u32>();
-                    if stack_clone.push(value).is_ok() {
-                        pushes += 1;
-                    }
-                } else {
-                    if stack_clone.pop().is_some() {
-                        pops += 1;
-                    }
+                    stack_clone.push(value);
+                    pushes += 1;
+                } else if stack_clone.pop().is_some() {
+                    pops += 1;
                 }
 
                 // Check if we should introduce a small delay
@@ -324,7 +295,7 @@ fn stress_test(verbose: bool) {
         // Validate that the stack size is correct
         assert_eq!(
             stack.len(),
-            total_pushes - total_pops as usize,
+            total_pushes - total_pops,
             "Stack size doesn't match expected value!"
         );
         println!("{}", "Stress test validation passed!".green().bold());
@@ -339,10 +310,10 @@ fn stress_test(verbose: bool) {
 }
 
 /// Run a quick verification test with less operations
-fn quick_verification_test(verbose: bool) {
+fn quick_verification_test() {
     println!("{}", "\nRunning quick verification test...".yellow().bold());
 
-    let stack = Arc::new(LockFreeStack::new(verbose));
+    let stack = Arc::new(LockFreeStack::new());
     let num_threads = 2;
     let operations_per_thread = 50;
 
@@ -355,7 +326,7 @@ fn quick_verification_test(verbose: bool) {
     let stack_clone = Arc::clone(&stack);
     let push_thread = thread::spawn(move || {
         for i in 0..operations_per_thread {
-            stack_clone.push(i).expect("Push should succeed");
+            stack_clone.push(i);
             if i % 10 == 0 {
                 println!("Pushed {} values", i);
             }

@@ -1,36 +1,34 @@
-# Hazard Pointers Demo
+# Hazard pointers demo
 
-This is a demonstration of using hazard pointers to solve the ABA problem in lock-free data structures, as described in the blog post [Solving the ABA Problem in Rust with Hazard Pointers](https://minikin.me/blog/solving-the-aba-problem-in-rust-hazard-pointers).
+Code for [Solving the ABA Problem in Rust with Hazard Pointers](https://minikin.me/blog/solving-the-aba-problem-in-rust-hazard-pointers/), part 3 of the ABA series.
 
-## What is the ABA Problem?
+`pop` publishes the head in the calling thread's hazard slot, re-reads `head` to validate the publication, and retires the node after winning the CAS. A retired node is freed only by a scan that finds it in no slot.
 
-The ABA problem occurs in concurrent programming when a thread reads a value A from a shared memory location, gets preempted, another thread changes the value to B and then back to A, and the first thread resumes, incorrectly assuming that the value has not changed since it was last read.
+- The registry is protected by a mutex. That keeps the ordering argument short, and it means `LockFreeStack` here is not actually lock-free. `HazardSlot` in `src/slot.rs` shows the lock-free publication with `SeqCst` on the store and the re-read.
+- `protect` returns a `HazardGuard` that clears the slot on every exit path, including early returns and panics.
+- `retire` releases the retire list lock before it calls `try_reclaim`, since `std::sync::Mutex` is not reentrant.
+- `Node::value` is a `ManuallyDrop<T>`: `pop` moves the value out, and reclaiming the node later frees the allocation without dropping the value again.
+- The registry is `Send` and `Sync` only for `T: Send`.
+- `src/buffer_pool.rs` is the buffer pool sketch from the post.
 
-Hazard pointers solve this by providing a way to protect specific memory locations from being recycled while they're in use.
-
-## Running the Demo
+## Running
 
 ```bash
-# Run the basic demo that shows protection against ABA
-cargo run
-
-# Run the benchmarks
+cargo run                                  # the ABA walkthrough
+cargo run -- --stress-test --no-show-aba-demo
+cargo test
 cargo bench
 ```
 
-## Implementation Details
+The walkthrough forces one interleaving with two channels: thread 1 publishes the head, thread 2 pops two nodes and forces a scan, which frees the unpublished node and keeps the published one, and thread 1's re-read of `head` then fails.
 
-This demo includes:
+Run the tests under Miri as well:
 
-1. A complete lock-free stack implementation using hazard pointers
-2. An ABA problem demonstration showing how hazard pointers protect against it
-3. Comparison with other techniques (comments in the code)
-4. Performance benchmarks (run with `cargo bench`)
+```bash
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test
+```
 
-## Learning More
+## Further reading
 
-For more information about hazard pointers and other solutions to the ABA problem, check out the following blog posts:
-
-- [Part 1: Tagged Pointers with Versioning](https://minikin.me/blog/solving-the-aba-problem-in-rust-tagged-pointers)
-- [Part 2: Epoch-Based Reclamation](https://minikin.me/blog/epoch-adventures-breaking-free-from-aba-in-concurrent-rust)
-- [Part 3: Hazard Pointers](https://minikin.me/blog/solving-the-aba-problem-in-rust-hazard-pointers) 
+- [Part 1: Tagged Pointers with Versioning](https://minikin.me/blog/solving-the-aba-problem-in-rust-tagged-pointers/)
+- [Part 2: Epoch-Based Reclamation](https://minikin.me/blog/epoch-adventures-breaking-free-from-aba-in-concurrent-rust/)
