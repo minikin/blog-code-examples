@@ -1,78 +1,39 @@
-# Lock-Free Stack with ABA Protection
+# Lock-free stack with tagged pointers
 
-This repository contains the code example for the blog post about implementing a lock-free stack in Rust with ABA protection using tagged pointers.
+Code for [Solving the ABA Problem in Rust with Tagged Pointers](https://minikin.me/blog/solving-the-aba-problem-in-rust-tagged-pointers/), part 1 of the ABA series.
 
-## The ABA Problem
+The stack head is a pointer and a 64-bit version packed into one `u128`. Every successful CAS bumps the version, so a thread holding a stale head loses its CAS even when the address has come back.
 
-The ABA problem is a common issue in lock-free algorithms where a thread incorrectly assumes that if a value hasn't changed, the data structure hasn't been modified. However, the value might have been changed to something else and then changed back, making this assumption invalid.
+The tag does not make it safe to read a node another thread has popped. Popped nodes go on a second tagged free list and are reused, and the pool is freed only in `Drop`, so a stale pointer always points at live memory. `next` is an `AtomicPtr` because a thread holding a stale tag reads it while the node's current owner writes it. Pointers are packed with `expose_provenance` and unpacked with `with_exposed_provenance_mut`, since `addr()` drops the provenance the round trip needs.
 
-```
-Time →
-Thread 1: Read A         →→→→→→→→ Try CAS(A->C) - Problem!
-Thread 2:    Remove A → Add B → Remove B → Add A
-```
+`AtomicU128` comes from `portable-atomic`, so the crate builds on stable.
 
-## Solution: Version Counting
+## Running
 
-This implementation uses version counting to prevent the ABA problem. Each pointer is paired with a version number that gets incremented on every modification, even if the same value is being added back to the stack.
-
->
-> This implementation uses `unsafe` code in several places for raw pointer manipulation.
-> Here's why each unsafe block is safe:
->
-> 1. Node Creation/Deletion:
->    - `Box::into_raw` is used only for newly created boxes, ensuring valid pointer creation
->    - `Box::from_raw` is only called on pointers that were created via `Box::into_raw`
->    - The stack maintains exclusive ownership of nodes through version counting
->    - No double-frees can occur due to ABA prevention via versioning
->
-> 2. Pointer Dereferencing:
->    - Pointers are only dereferenced after successful CAS operations
->    - Version checking ensures we never use dangling pointers
->    - `next` pointers are only accessed while holding a reference to the current node
->    - Null checks are performed before any pointer dereference
->
-> 3. MaybeUninit Usage:
->    - Values are initialized immediately in `push()` using `MaybeUninit::new()`
->    - `assume_init()` is only called in `pop()` after successful CAS
->    - Values are never read before initialization
->    - Dropped nodes are properly reconstructed into boxes
->
-> 4. Memory Ordering:
->    - `Acquire` ordering on loads ensures visibility of node contents
->    - `Release` ordering on stores ensures all previous writes are visible
->    - `Relaxed` ordering is only used for operations that don't require synchronization
->    - Full memory fence on successful CAS operations maintains proper happens-before relationships
-
-## Running the Tests
-
-To run the regular test suite:
 ```bash
+cargo run
 cargo test
 ```
 
-To run the benchmarks (requires nightly Rust):
-```bash
-cargo +nightly bench
+`cargo run` forces one interleaving with two channels and prints the same output every time:
+
+```text
+T1 read the head at version 3
+T2 popped 3
+T2 popped 2
+T2 pushed 3 back, head is at version 6
+T1 CAS failed: it expected version 3, found 6
+stack from the top: 3 1
 ```
 
-## Implementation Details
+Miri checks the unsafe code, including the threaded tests. Packing a pointer into an integer is exposed provenance, so it needs `-Zmiri-permissive-provenance`:
 
-The implementation uses:
-- Atomic operations with `AtomicU128`
-- Version counting for ABA prevention
-- Safe memory management with Rust's ownership system
-- Full test coverage including concurrent operation tests
+```bash
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance" cargo +nightly miri test
+```
 
-## Safety Notes
-
-This implementation:
-- Is lock-free (progress guarantee)
-- Is memory safe (leverages Rust's ownership system)
-- Handles concurrent push/pop operations
-- Prevents the ABA problem
-- Uses atomic operations for thread safety
+`cargo bench` runs the comparison behind the table in the post: this stack against the same pooled stack with plain `AtomicPtr` heads, one thread and eight, each doing a push and then a pop. The plain version is ABA-prone and exists only to price the 64-bit CAS against the 128-bit one.
 
 ## License
 
-MIT License - feel free to use this code in your own projects.
+MIT

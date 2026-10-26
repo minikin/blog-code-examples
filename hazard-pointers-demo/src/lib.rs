@@ -1,28 +1,63 @@
+//! Hazard pointers protecting a Treiber stack, the code for part 3 of the ABA
+//! series: <https://minikin.me/blog/solving-the-aba-problem-in-rust-hazard-pointers/>
+
 use std::collections::HashSet;
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
-/// A thread-local hazard pointer registry
+mod buffer_pool;
+pub mod slot;
+
+pub use slot::HazardSlot;
+
+/// A registry of pointers that threads are currently reading.
 ///
-/// This struct maintains a list of pointers that a thread is currently using,
-/// protecting them from being reclaimed by other threads.
-pub struct HazardPointers<T> {
-    /// Map from thread ID to list of hazard pointers
+/// One slot per thread, which is all a Treiber stack needs. A list or queue
+/// walk needs several slots per thread.
+pub struct HazardPointers<T: Send> {
     thread_hazards: Mutex<Vec<(ThreadId, *mut T)>>,
-    /// Global retirement list of nodes awaiting safe reclamation
     retire_list: Mutex<Vec<*mut T>>,
 }
 
-// Safety: HazardPointers can be safely shared between threads because
-// all its mutations are protected by internal mutexes
-unsafe impl<T> Send for HazardPointers<T> {}
-unsafe impl<T> Sync for HazardPointers<T> {}
+// Safety: the registry only moves raw pointers around and deallocates them.
+// `T: Send` is required because the thread that deallocates a node is not the
+// thread that allocated it.
+unsafe impl<T: Send> Send for HazardPointers<T> {}
+unsafe impl<T: Send> Sync for HazardPointers<T> {}
 
-impl<T> HazardPointers<T> {
-    /// Creates a new hazard pointer registry
+/// Clears the calling thread's hazard slot when it goes out of scope, on every
+/// path out of the function, including an early return or a panic.
+pub struct HazardGuard<'a, T: Send> {
+    registry: &'a HazardPointers<T>,
+    ptr: *mut T,
+}
+
+impl<T: Send> HazardGuard<'_, T> {
+    pub fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+}
+
+impl<T: Send> Drop for HazardGuard<'_, T> {
+    fn drop(&mut self) {
+        self.registry.clear_hazards();
+    }
+}
+
+impl<T: Send> Default for HazardPointers<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send> HazardPointers<T> {
+    /// Reclamation is attempted once the retire list reaches this length.
+    const RECLAIM_THRESHOLD: usize = 16;
+
     pub fn new() -> Self {
         HazardPointers {
             thread_hazards: Mutex::new(Vec::new()),
@@ -30,441 +65,227 @@ impl<T> HazardPointers<T> {
         }
     }
 
-    /// Registers a hazard pointer for the current thread
+    /// Publishes `ptr` as in use by the calling thread.
     ///
-    /// This protects the given pointer from being reclaimed by other threads
-    /// until explicitly cleared with clear_hazards().
-    pub fn protect(&self, ptr: *mut T) -> *mut T {
+    /// The caller must still re-read the source location and compare it with
+    /// `ptr` before dereferencing.
+    pub fn protect(&self, ptr: *mut T) -> HazardGuard<'_, T> {
         if !ptr.is_null() {
             let thread_id = thread::current().id();
             let mut hazards = self
                 .thread_hazards
                 .lock()
-                .expect("Failed to lock hazard list - mutex poisoned");
+                .expect("hazard list mutex poisoned");
 
-            // Check if we already have an entry for this thread
-            for entry in hazards.iter_mut() {
-                if entry.0 == thread_id {
-                    entry.1 = ptr;
-                    return ptr;
-                }
+            match hazards.iter_mut().find(|entry| entry.0 == thread_id) {
+                Some(entry) => entry.1 = ptr,
+                None => hazards.push((thread_id, ptr)),
             }
-
-            // No existing entry, add a new one
-            hazards.push((thread_id, ptr));
         }
-        ptr
+        HazardGuard {
+            registry: self,
+            ptr,
+        }
     }
 
-    /// Clears all hazard pointers for the current thread
-    ///
-    /// This should be called when the thread no longer needs to access
-    /// previously protected pointers.
+    /// Clears the calling thread's hazard slot.
     pub fn clear_hazards(&self) {
         let thread_id = thread::current().id();
         let mut hazards = self
             .thread_hazards
             .lock()
-            .expect("Failed to lock hazard list - mutex poisoned");
+            .expect("hazard list mutex poisoned");
         hazards.retain(|entry| entry.0 != thread_id);
     }
+}
 
-    /// Adds a pointer to the retirement list for later reclamation
+impl<T: Send> HazardPointers<T> {
+    /// Hands a pointer over for deallocation once no thread is reading it.
     ///
-    /// The memory will be reclaimed when it's safe to do so (i.e., when no thread
-    /// has it marked as hazardous).
-    pub fn retire(&self, ptr: *mut T) {
-        if !ptr.is_null() {
-            let mut retire = self
-                .retire_list
-                .lock()
-                .expect("Failed to lock retire list - mutex poisoned");
+    /// # Safety
+    ///
+    /// `ptr` must come from `Box::into_raw`, must already be unlinked from the
+    /// shared structure, and must not be retired twice.
+    pub unsafe fn retire(&self, ptr: *mut T) {
+        if ptr.is_null() {
+            return;
+        }
+        let len = {
+            let mut retire = self.retire_list.lock().expect("retire list mutex poisoned");
             retire.push(ptr);
-
-            // Attempt to reclaim memory if retire list is getting large
-            if retire.len() > 10 {
-                self.try_reclaim(false);
-            }
+            retire.len()
+        };
+        // The guard above is released before try_reclaim takes the same lock:
+        // std::sync::Mutex is not reentrant.
+        if len >= Self::RECLAIM_THRESHOLD {
+            self.try_reclaim(false);
         }
     }
 
-    /// Attempts to reclaim memory from the retirement list
-    ///
-    /// This scans all hazard pointers across all threads and only reclaims
-    /// memory that isn't protected by any thread.
-    ///
-    /// If `force` is true, this will attempt to reclaim memory even if the
-    /// retire list is small.
+    /// Frees every retired pointer that no thread has published, and returns
+    /// how many it freed.
     pub fn try_reclaim(&self, force: bool) -> usize {
-        // Get the current set of hazardous pointers
-        // This must happen atomically with respect to the retirement list processing
-        let hazards = self
-            .thread_hazards
-            .lock()
-            .expect("Failed to lock hazard list - mutex poisoned");
-        let hazardous: HashSet<*mut T> = hazards.iter().map(|entry| entry.1).collect();
+        let hazardous: HashSet<*mut T> = {
+            let hazards = self
+                .thread_hazards
+                .lock()
+                .expect("hazard list mutex poisoned");
+            hazards.iter().map(|entry| entry.1).collect()
+        };
 
-        // Get the retirement list
-        let mut retire = self
-            .retire_list
-            .lock()
-            .expect("Failed to lock retire list - mutex poisoned");
+        let to_free = {
+            let mut retire = self.retire_list.lock().expect("retire list mutex poisoned");
+            if retire.is_empty() || (!force && retire.len() < Self::RECLAIM_THRESHOLD) {
+                return 0;
+            }
+            let (to_free, still_hazardous): (Vec<*mut T>, Vec<*mut T>) =
+                retire.drain(..).partition(|ptr| !hazardous.contains(ptr));
+            *retire = still_hazardous;
+            to_free
+        };
 
-        // If the retire list is empty or too small and we're not forcing reclamation, do nothing
-        if retire.is_empty() || (!force && retire.len() <= 5) {
-            return 0;
-        }
-
-        // Separate nodes that are safe to reclaim from those that are still hazardous
-        let (to_free, still_hazardous): (Vec<*mut T>, Vec<*mut T>) =
-            retire.drain(..).partition(|ptr| !hazardous.contains(ptr));
-
-        // Update the retirement list with nodes that couldn't be freed yet
-        *retire = still_hazardous;
-
-        // Count how many nodes we freed
-        let freed_count = to_free.len();
-
-        // Free the safe nodes
-        for ptr in to_free {
+        for ptr in &to_free {
+            // Safety: the pointer was retired, so it is unlinked, and it is
+            // absent from every hazard slot read above.
             unsafe {
-                let _ = Box::from_raw(ptr);
+                drop(Box::from_raw(*ptr));
             }
         }
-
-        freed_count
+        to_free.len()
     }
-}
 
-impl<T> Drop for HazardPointers<T> {
-    fn drop(&mut self) {
-        // Final reclamation attempt to free everything
-        self.try_reclaim(true);
-
-        // If there are still pointers in the retire list, that means they're
-        // still protected by some thread, which is a bug (memory leak)
-        let retire = self
-            .retire_list
+    /// How many pointers are waiting for reclamation. Test helper.
+    pub fn retired_len(&self) -> usize {
+        self.retire_list
             .lock()
-            .expect("Failed to lock retire list - mutex poisoned");
-        if !retire.is_empty() {
-            // Just log a warning in a real application you might want to panic
-            eprintln!("Warning: HazardPointers dropped with {} items still in retire list. This is a memory leak.", retire.len());
-        }
+            .expect("retire list mutex poisoned")
+            .len()
     }
 }
 
-/// A node in our lock-free stack
+impl<T: Send> Drop for HazardPointers<T> {
+    fn drop(&mut self) {
+        self.try_reclaim(true);
+        let retire = self.retire_list.lock().expect("retire list mutex poisoned");
+        assert!(
+            retire.is_empty(),
+            "{} retired pointers were still published when the registry was dropped",
+            retire.len()
+        );
+    }
+}
+
+/// A stack node. `value` is moved out on pop, so the node must be deallocated
+/// without dropping it a second time.
 pub struct Node<T> {
-    /// The value stored in this node
-    pub value: T,
-    /// Pointer to the next node in the stack
-    pub next: *mut Node<T>,
+    pub value: ManuallyDrop<T>,
+    pub next: AtomicPtr<Node<T>>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Node")
-            .field("value", &self.value)
+            .field("value", &*self.value)
             .field("next", &self.next)
             .finish()
     }
 }
 
-/// A lock-free stack using hazard pointers for memory management
-///
-/// This implementation is thread-safe and prevents the ABA problem
-/// through the use of hazard pointers.
-pub struct LockFreeStack<T> {
-    /// Atomic pointer to the head of the stack
+pub struct LockFreeStack<T: Send> {
     pub head: AtomicPtr<Node<T>>,
-    /// Hazard pointer registry used to protect nodes from reclamation
     pub hazard_pointers: Arc<HazardPointers<Node<T>>>,
-    /// Counter tracking the current size of the stack
     size: AtomicUsize,
-    /// Whether to print debug information
-    verbose: bool,
 }
 
-impl<T> LockFreeStack<T> {
-    /// Creates a new empty stack
-    pub fn new(verbose: bool) -> Self {
+impl<T: Send> Default for LockFreeStack<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send> LockFreeStack<T> {
+    pub fn new() -> Self {
         LockFreeStack {
             head: AtomicPtr::new(ptr::null_mut()),
             hazard_pointers: Arc::new(HazardPointers::new()),
             size: AtomicUsize::new(0),
-            verbose,
         }
     }
 
-    /// Pushes a value onto the stack
-    pub fn push(&self, value: T) -> Result<(), String> {
-        // Create a new node
+    pub fn push(&self, value: T) {
         let new_node = Box::into_raw(Box::new(Node {
-            value,
-            next: ptr::null_mut(),
+            value: ManuallyDrop::new(value),
+            next: AtomicPtr::new(ptr::null_mut()),
         }));
 
         loop {
-            // Get the current head with Acquire ordering to ensure we see all
-            // previous writes to the stack
             let current_head = self.head.load(Ordering::Acquire);
+            // Safety: new_node is ours until the CAS below publishes it.
+            unsafe { (*new_node).next.store(current_head, Ordering::Relaxed) };
 
-            // Point our new node to the current head
-            unsafe {
-                (*new_node).next = current_head;
-            }
-
-            if self.verbose {
-                println!(
-                    "Attempting to push node: {:p} with next pointing to: {:p}",
-                    new_node, current_head
-                );
-            }
-
-            // Try to update the head to our new node
-            // Release ensures previous writes are visible to other threads
-            // Relaxed is used for failure case as we'll retry anyway
-            match self.head.compare_exchange(
-                current_head,
-                new_node,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Successfully pushed the node
-                    self.size.fetch_add(1, Ordering::Relaxed);
-                    if self.verbose {
-                        println!("Successfully pushed node: {:p}", new_node);
-                    }
-                    return Ok(());
-                }
-                Err(actual_head) => {
-                    // Failed to push, try again with the updated head
-                    if self.verbose {
-                        println!(
-                            "Push conflict detected! Expected head: {:p}, actual head: {:p}",
-                            current_head, actual_head
-                        );
-                    }
-                    unsafe {
-                        (*new_node).next = actual_head;
-                    }
-                }
+            if self
+                .head
+                .compare_exchange(current_head, new_node, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.size.fetch_add(1, Ordering::Relaxed);
+                return;
             }
         }
     }
+}
 
-    /// Pops a value from the stack
+impl<T: Send> LockFreeStack<T> {
     pub fn pop(&self) -> Option<T> {
         loop {
-            // Get the current head with Acquire ordering to ensure
-            // we see all previous writes to the stack
             let current_head = self.head.load(Ordering::Acquire);
             if current_head.is_null() {
-                // Stack is empty
-                if self.verbose {
-                    println!("Stack is empty, cannot pop");
-                }
                 return None;
             }
 
-            if self.verbose {
-                println!("Attempting to pop head: {:p}", current_head);
-            }
-
-            // Mark this pointer as hazardous before accessing it
-            // This prevents other threads from freeing it while we're using it
-            let protected_head = self.hazard_pointers.protect(current_head);
-
-            // Check if the head has changed since we loaded it
-            // This is a crucial ABA prevention step - if head changed, retry
+            // Publish the pointer, then re-read head. The guard clears the
+            // slot on every path out of this function.
+            let guard = self.hazard_pointers.protect(current_head);
             if self.head.load(Ordering::Acquire) != current_head {
-                if self.verbose {
-                    println!("Head changed during protection, retrying pop");
-                }
                 continue;
             }
 
-            // Get the next node - safe because we've protected the pointer
-            let next = unsafe { (*protected_head).next };
+            // Safety: current_head is published and was still head after
+            // publication, so no thread can have freed it.
+            let next = unsafe { (*guard.as_ptr()).next.load(Ordering::Acquire) };
 
-            // Try to update the head to the next node
-            // Release ensures all previous writes are visible to other threads
-            match self.head.compare_exchange(
-                current_head,
-                next,
-                Ordering::Release, // Success case needs Release to make changes visible
-                Ordering::Relaxed, // Failure case can be Relaxed as we'll retry anyway
-            ) {
-                Ok(_) => {
-                    // Successfully popped the node, extract its value
-                    let value = unsafe {
-                        // Move out the value
-                        let v = std::ptr::read(&(*protected_head).value);
-                        v
-                    };
-
-                    self.size.fetch_sub(1, Ordering::Relaxed);
-
-                    if self.verbose {
-                        println!(
-                            "Successfully popped head: {:p}, new head: {:p}",
-                            protected_head, next
-                        );
-                    }
-
-                    // Clear hazard pointer and schedule node for reclamation
-                    self.hazard_pointers.clear_hazards();
-                    self.hazard_pointers.retire(protected_head);
-
-                    return Some(value);
-                }
-                Err(_) => {
-                    // Failed to pop, retry
-                    if self.verbose {
-                        println!("Pop conflict detected! Head changed during CAS");
-                    }
-                    continue;
-                }
+            if self
+                .head
+                .compare_exchange(current_head, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Safety: this thread won the CAS, so it alone unlinked the
+                // node and alone moves the value out.
+                let value = unsafe { ManuallyDrop::take(&mut (*guard.as_ptr()).value) };
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                drop(guard);
+                // Safety: the node is unlinked, retired once, and its value
+                // has been moved out.
+                unsafe { self.hazard_pointers.retire(current_head) };
+                return Some(value);
             }
         }
     }
+}
 
-    /// Returns the current size of the stack
+impl<T: Send> LockFreeStack<T> {
     pub fn len(&self) -> usize {
-        // Relaxed is sufficient for a simple counter read
         self.size.load(Ordering::Relaxed)
     }
 
-    /// Returns true if the stack is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/// Clean up resources when the stack is dropped
-impl<T> Drop for LockFreeStack<T> {
+impl<T: Send> Drop for LockFreeStack<T> {
     fn drop(&mut self) {
-        // Pop all elements to ensure memory is freed
         while self.pop().is_some() {}
-
-        // Final reclamation attempt
         self.hazard_pointers.try_reclaim(true);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn test_basic_operations() {
-        let stack = LockFreeStack::new(false);
-        assert!(stack.is_empty());
-
-        stack.push(1).expect("Push should succeed");
-        stack.push(2).expect("Push should succeed");
-        stack.push(3).expect("Push should succeed");
-
-        assert_eq!(stack.len(), 3);
-        assert_eq!(stack.pop(), Some(3));
-        assert_eq!(stack.pop(), Some(2));
-        assert_eq!(stack.pop(), Some(1));
-        assert_eq!(stack.pop(), None);
-        assert!(stack.is_empty());
-    }
-
-    #[test]
-    fn test_concurrent_operations() {
-        let stack = Arc::new(LockFreeStack::new(false));
-        let threads = 4;
-        let operations_per_thread = 100;
-
-        let mut handles = Vec::new();
-
-        // Push threads
-        for i in 0..threads {
-            let stack = Arc::clone(&stack);
-            let handle = thread::spawn(move || {
-                for j in 0..operations_per_thread {
-                    stack
-                        .push(i * operations_per_thread + j)
-                        .expect("Push should succeed");
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Pop threads
-        for _ in 0..threads / 2 {
-            let stack = Arc::clone(&stack);
-            let handle = thread::spawn(move || {
-                for _ in 0..operations_per_thread {
-                    let _ = stack.pop();
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle
-                .join()
-                .expect("Thread panicked during concurrent operations");
-        }
-
-        assert_eq!(stack.len(), operations_per_thread * threads / 2);
-
-        // Clean up remaining elements
-        while stack.pop().is_some() {}
-    }
-
-    #[test]
-    fn test_aba_prevention() {
-        let stack = Arc::new(LockFreeStack::new(false));
-
-        // Initial state
-        stack.push(1).expect("Push should succeed");
-        stack.push(2).expect("Push should succeed");
-
-        let stack_clone1 = Arc::clone(&stack);
-        let stack_clone2 = Arc::clone(&stack);
-
-        // Thread 1: Start pop operation but get interrupted
-        let handle1 = thread::spawn(move || {
-            // Begin pop operation and protect head
-            let head = stack_clone1.head.load(Ordering::Acquire);
-            stack_clone1.hazard_pointers.protect(head);
-
-            // Pause to allow Thread 2 to run
-            thread::sleep(Duration::from_millis(100));
-
-            // Try to complete the pop operation
-            let result = stack_clone1.pop();
-            stack_clone1.hazard_pointers.clear_hazards();
-            result
-        });
-
-        // Thread 2: Perform operations while Thread 1 is paused
-        let handle2 = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-
-            // Pop both values
-            let val1 = stack_clone2.pop().expect("First pop should succeed");
-            let val2 = stack_clone2.pop().expect("Second pop should succeed");
-
-            // Push them in reverse order
-            stack_clone2.push(val1).expect("Push should succeed");
-            stack_clone2.push(val2).expect("Push should succeed");
-        });
-
-        // Both threads should complete successfully
-        let thread1_result = handle1.join().expect("Thread 1 panicked");
-        handle2.join().expect("Thread 2 panicked");
-
-        // Verify operation succeeded
-        assert!(thread1_result.is_some());
     }
 }

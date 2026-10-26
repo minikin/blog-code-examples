@@ -8,10 +8,10 @@ pub fn diagnose_lockfree_stack() {
     println!("Starting LockFreeStack diagnostics");
 
     // Basic push and pop test
-    let stack = LockFreeStack::new(true); // Enable verbose mode
+    let stack = LockFreeStack::new();
 
     println!("Pushing value 42");
-    stack.push(42).expect("Push should succeed");
+    stack.push(42);
 
     println!("Popping value");
     match stack.pop() {
@@ -21,10 +21,10 @@ pub fn diagnose_lockfree_stack() {
 
     // Concurrent test with hazard pointer protection
     println!("\nTesting concurrent operations with hazard pointer protection");
-    let stack = Arc::new(LockFreeStack::new(true));
+    let stack = Arc::new(LockFreeStack::new());
 
     // Push a value
-    stack.push(42).expect("Push should succeed");
+    stack.push(42);
 
     // Create a clone of the stack for another thread
     let stack_clone = Arc::clone(&stack);

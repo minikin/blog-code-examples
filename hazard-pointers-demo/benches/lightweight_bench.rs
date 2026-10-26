@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use hazard_pointers_demo::LockFreeStack;
 use std::sync::Arc;
 use std::thread;
@@ -21,9 +21,9 @@ fn lightweight_bench(c: &mut Criterion) {
     // Single-threaded push
     group.bench_function("push", |b| {
         b.iter_batched(
-            || LockFreeStack::<i32>::new(false),
+            LockFreeStack::<i32>::new,
             |stack| {
-                stack.push(42).expect("Push should succeed");
+                stack.push(42);
             },
             BatchSize::SmallInput,
         );
@@ -33,8 +33,8 @@ fn lightweight_bench(c: &mut Criterion) {
     group.bench_function("pop", |b| {
         b.iter_batched(
             || {
-                let stack = LockFreeStack::new(false);
-                stack.push(42).expect("Push should succeed");
+                let stack = LockFreeStack::new();
+                stack.push(42);
                 stack
             },
             |stack| {
@@ -47,13 +47,13 @@ fn lightweight_bench(c: &mut Criterion) {
     // Very limited concurrent operations
     group.bench_function("concurrent_ops_2_threads", |b| {
         b.iter_batched(
-            || Arc::new(LockFreeStack::<i32>::new(false)),
+            || Arc::new(LockFreeStack::<i32>::new()),
             |stack| {
                 let stack2 = Arc::clone(&stack);
 
                 let handle1 = thread::spawn(move || {
-                    stack.push(1).expect("Push should succeed");
-                    stack.push(2).expect("Push should succeed");
+                    stack.push(1);
+                    stack.push(2);
                 });
 
                 let handle2 = thread::spawn(move || {
