@@ -3,4 +3,4 @@ mod stack;
 
 pub use queue::LockFreeQueue;
 pub use queue::QueueError;
-pub use stack::LockFreeStack;
+pub use stack::{LockFreeStack, StackError};

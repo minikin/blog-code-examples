@@ -1,70 +1,28 @@
-# Lock-Free Data Structures with EBR-based ABA Protection
+# Lock-free stack and queue with epoch-based reclamation
 
-This repository contains the code examples for implementing lock-free data structures in Rust with ABA protection using Epoch-Based Reclamation (EBR).
+Code for [Epoch Adventures: Breaking Free from ABA in Concurrent Rust](https://minikin.me/blog/epoch-adventures-breaking-free-from-aba-in-concurrent-rust/), part 2 of the ABA series.
 
-## The ABA Problem and EBR Solution
+Both structures use `crossbeam-epoch`. A popped node is handed to `defer_destroy` and freed once the global epoch has advanced twice, so its address cannot come back from the allocator while any thread pinned at the time could still hold it.
 
-The ABA problem occurs in lock-free algorithms when a thread incorrectly assumes that if a value hasn't changed, the data structure hasn't been modified. EBR solves this by:
+- `LockFreeStack` is the Treiber stack from the post. The value is a `ManuallyDrop<T>`, so moving it out in `pop` and then destroying the node drops it once. The node stays `Owned` until the CAS takes it, so `push` has no `unsafe` and cannot leak on a retry. There is no retry limit. `with_capacity` claims a slot with a CAS before allocating, so the bound holds under contention.
+- `LockFreeQueue` is a Michael-Scott queue with a sentinel node. `dequeue` moves the value out of the node that becomes the new sentinel, values are `MaybeUninit<T>` so no node drops its own value, and `Drop` drops the values still queued.
 
-1. Managing memory safely through epochs
-2. Preventing premature memory reclamation
-3. Ensuring nodes aren't reused while other threads might still access them
+## Running
 
-```
-Time →
-Thread 1: Read A         →→→→→→→→ Safe operation! (EBR prevents reuse)
-Thread 2:    Remove A → Add B → Remove B → Add new_A
-```
-
-## Implementation Details
-
-The implementation uses:
-- Crossbeam's epoch-based memory reclamation (`crossbeam-epoch`)
-- Lock-free algorithms for stack and queue implementations
-- Safe concurrent memory management
-- Comprehensive benchmarking suite
-
-## Running the Tests and Benchmarks
-
-To run the regular test suite:
 ```bash
+cargo run
 cargo test
-```
-
-To run the benchmarks:
-```bash
 cargo bench
 ```
 
-The benchmarks compare:
-- EBR-protected stack operations
-- EBR-protected queue operations
-- Mutex-based implementations (as baseline)
-- Single-threaded vs concurrent performance
+The suite runs under Miri with Tree Borrows. Stacked Borrows reports a violation inside crossbeam's intrusive participant list, and crossbeam's global collector is never freed, hence the leak flag:
 
-## Data Structures
+```bash
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks -Zmiri-disable-isolation" cargo +nightly miri test --lib
+```
 
-The repository includes:
-- Lock-free Stack implementation
-- Lock-free Queue implementation
-- Benchmark comparisons with traditional mutex-based approaches
-
-## Safety Features
-
-This implementation:
-- Is lock-free (progress guarantee)
-- Is memory safe through EBR
-- Handles concurrent operations safely
-- Prevents the ABA problem without atomic version counting
-- Uses Rust's type system for compile-time guarantees
-
-## Dependencies
-
-- `crossbeam-epoch`: For epoch-based reclamation
-- `crossbeam-utils`: For additional concurrent utilities
-- `rand`: For testing and benchmarking
-- `criterion`: For benchmarking
+`benches/concurrent_benchmarks.rs` holds the workloads behind the table in the post: one thread doing a push and a pop, and 2, 4 and 8 threads pushing at once, against the EBR stack, a `Mutex<Vec>` and a `Mutex` around a linked list that allocates per push.
 
 ## License
 
-MIT License - feel free to use this code in your own projects.
+MIT
